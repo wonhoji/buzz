@@ -771,7 +771,8 @@ impl DbConfig {
     /// environment variables. Missing or invalid values retain the existing
     /// configuration; explicit zeroes pass through to disable the lock and
     /// idle timeouts, while the statement timeout is still clamped at connect
-    /// time (see [`Self::effective_statement_timeout_ms`]).
+    /// time (see [`Self::effective_statement_timeout_ms`]). The pool acquire
+    /// timeout (`BUZZ_DB_ACQUIRE_TIMEOUT_SECS`) is overlaid here too.
     ///
     /// This belongs in `buzz-db` so relay, admin, deletion, and audit writers
     /// share one policy. The separately deployed push gateway owns its own
@@ -791,6 +792,12 @@ impl DbConfig {
         }
         if let Some(value) = parse("BUZZ_DB_STATEMENT_TIMEOUT_MS") {
             self.statement_timeout_ms = value;
+        }
+        // A busy host can take longer than the 3s default to ping or open a
+        // connection, which the pool reports as `PoolTimedOut` even when it is
+        // far from full. Zero would fail every acquire, so it is ignored.
+        if let Some(value) = parse("BUZZ_DB_ACQUIRE_TIMEOUT_SECS").filter(|&v| v > 0) {
+            self.acquire_timeout_secs = value;
         }
         self
     }
