@@ -365,6 +365,46 @@ fn valid_link_preview_text(value: &str, max: usize, allow_newlines: bool) -> boo
             .any(|character| character.is_control() && !(allow_newlines && character == '\n'))
 }
 
+/// Desktop serializes the canonical URL through WHATWG `URL` — a bare host gains
+/// a trailing `/`, non-ASCII is percent-encoded, the host is lowercased — so it can
+/// differ from the text the user typed (block/buzz#6347). Accept a body URL that
+/// serializes to the same URL; one the body never mentions is still rejected.
+fn content_mentions_url(content: &str, canonical: &url::Url) -> bool {
+    content
+        .split(|c: char| {
+            c.is_whitespace() || matches!(c, '<' | '>' | '(' | ')' | '[' | ']' | '"' | '\'')
+        })
+        .map(|token| token.trim_end_matches(['.', ',', ';', ':', '!', '?']))
+        // A real URL is short; the cap keeps a 60KB single-token body from
+        // running IDNA over a huge host once per snapshot tag.
+        .filter(|token| !token.is_empty() && token.len() <= 2048)
+        .any(|token| {
+            let has_scheme = token.contains("://");
+            let candidate = if has_scheme {
+                token.to_string()
+            } else if token.contains('.') {
+                format!("https://{token}")
+            } else {
+                return false;
+            };
+            url::Url::parse(&candidate).is_ok_and(|mut url| {
+                // Without a scheme, prose like `v1.2` or `10.1` would otherwise
+                // count as a link: require a domain whose last label is alphabetic.
+                if !has_scheme
+                    && !url.domain().is_some_and(|domain| {
+                        domain.rsplit('.').next().is_some_and(|tld| {
+                            tld.len() >= 2 && tld.chars().all(|c| c.is_ascii_alphabetic())
+                        })
+                    })
+                {
+                    return false;
+                }
+                url.set_fragment(None);
+                url == *canonical
+            })
+        })
+}
+
 fn validate_link_preview_tags(event: &Event, media_base_url: &str) -> Result<(), String> {
     const MAX_SNAPSHOTS: usize = 8;
     const MAX_TITLE: usize = 300;
@@ -402,7 +442,8 @@ fn validate_link_preview_tags(event: &Event, media_base_url: &str) -> Result<(),
             || canonical.password().is_some()
             || canonical.fragment().is_some()
             || !seen.insert(parts[3].clone())
-            || !event.content.contains(&parts[3])
+            || !(event.content.contains(&parts[3])
+                || content_mentions_url(&event.content, &canonical))
         {
             return Err("invalid link-preview canonical URL".into());
         }
@@ -4753,6 +4794,59 @@ mod postgres_tests {
         ] {
             let event = make_event_with_tags(KIND_STREAM_MESSAGE, "https://example.com", &tags);
             assert!(validate_link_preview_tags(&event, "https://media.example.com").is_err());
+        }
+    }
+
+    #[test]
+    fn link_preview_canonical_url_matches_normalized_body_url() {
+        let accepts = |content: &str, canonical: &str| {
+            let event = make_event_with_tags(
+                KIND_STREAM_MESSAGE,
+                content,
+                &[&[
+                    "link-preview",
+                    "snapshot",
+                    "1",
+                    canonical,
+                    "Title",
+                    "Site",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                ]],
+            );
+            validate_link_preview_tags(&event, "https://media.example.com").is_ok()
+        };
+        for (content, canonical) in [
+            (
+                "see https://api.airtable.com returned 403",
+                "https://api.airtable.com/",
+            ),
+            (
+                "문서 https://gilla.app/문서 확인",
+                "https://gilla.app/%EB%AC%B8%EC%84%9C",
+            ),
+            (
+                "https://example.com/path?q=한글.",
+                "https://example.com/path?q=%ED%95%9C%EA%B8%80",
+            ),
+            ("https://GitHub.com/a/b", "https://github.com/a/b"),
+            ("gilla.app/docs 참고", "https://gilla.app/docs"),
+            ("[링크](https://example.com/a#top)", "https://example.com/a"),
+        ] {
+            assert!(accepts(content, canonical), "{content} -> {canonical}");
+        }
+        for (content, canonical) in [
+            ("https://example.com/a", "https://example.com/b"),
+            ("https://example.com.evil.test/", "https://example.com/"),
+            ("no links here", "https://example.com/"),
+            ("http://example.com", "https://example.com/"),
+            ("version 10.1 released", "https://10.0.0.1/"),
+            ("see v1.2", "https://v1.2/"),
+        ] {
+            assert!(!accepts(content, canonical), "{content} -> {canonical}");
         }
     }
 
